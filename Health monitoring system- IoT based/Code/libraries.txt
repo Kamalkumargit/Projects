@@ -1,0 +1,8 @@
+# Wokwi Library List
+# See https://docs.wokwi.com/guides/libraries
+
+WiFi
+LiquidCrystal I2C
+OneWire
+Blynk
+DHT sensor library
