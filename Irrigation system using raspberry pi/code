@@ -1,1 +1,224 @@
+#!/usr/bin/env python3
 
+# Smart Irrigation System for Raspberry Pi
+# Sensors: DHT22 (Temperature & Humidity), Soil Moisture, Rain Sensor
+
+import time
+import RPi.GPIO as GPIO
+import Adafruit_DHT
+
+# Set GPIO mode
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+# Define GPIO pins
+DHT_PIN = 4              # DHT22 sensor pin
+SOIL_MOISTURE_PIN = 17   # Soil moisture sensor digital pin
+RAIN_SENSOR_PIN = 27     # Rain sensor digital pin
+RELAY_PIN = 22           # Relay for water pump/motor
+
+# DHT sensor type
+DHT_SENSOR = Adafruit_DHT.DHT22
+
+# Setup GPIO pins
+GPIO.setup(SOIL_MOISTURE_PIN, GPIO.IN)
+GPIO.setup(RAIN_SENSOR_PIN, GPIO.IN)
+GPIO.setup(RELAY_PIN, GPIO.OUT)
+
+# Initialize relay to OFF
+GPIO.output(RELAY_PIN, GPIO.LOW)
+
+# GSM Module (Serial communication) - Optional
+try:
+    import serial
+    gsm_available = True
+    ser = serial.Serial('/dev/ttyS0', 9600, timeout=1)
+    time.sleep(2)
+    print("GSM module initialized")
+except:
+    gsm_available = False
+    print("GSM module not available (optional)")
+
+def read_dht22():
+    """Read temperature and humidity from DHT22 sensor"""
+    humidity, temperature = Adafruit_DHT.read_retry(DHT_SENSOR, DHT_PIN)
+    if humidity is not None and temperature is not None:
+        return temperature, humidity
+    else:
+        print("Failed to read from DHT22 sensor")
+        return None, None
+
+def read_soil_moisture():
+    """Read soil moisture sensor with retry logic (Digital output)
+    Returns: True if soil is DRY, False if soil is WET"""
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            soil_status = GPIO.input(SOIL_MOISTURE_PIN)
+            return soil_status
+        except Exception as e:
+            if attempt < max_attempts - 1:
+                time.sleep(0.5)
+            else:
+                print(f"Failed to read soil moisture sensor: {e}")
+                return False
+
+def read_rain_sensor():
+    """Read rain sensor with retry logic (Digital output)
+    Returns: True if NO rain, False if rain detected"""
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            rain_status = GPIO.input(RAIN_SENSOR_PIN)
+            return rain_status
+        except Exception as e:
+            if attempt < max_attempts - 1:
+                time.sleep(0.5)
+            else:
+                print(f"Failed to read rain sensor: {e}")
+                return True  # Default to "no rain" on error
+
+def send_sms(message):
+    """Send SMS via GSM module"""
+    if gsm_available:
+        try:
+            ser.write(b'AT\r\n')
+            time.sleep(0.5)
+            ser.write(b'AT+CMGF=1\r\n')
+            time.sleep(0.5)
+            ser.write(b'AT+CMGS="+919922512017"\r\n')
+            time.sleep(0.5)
+            ser.write(message.encode() + b'\r\n')
+            time.sleep(0.5)
+            ser.write(bytes([26]))  # Ctrl+Z to send
+            time.sleep(2)
+            print(f"SMS sent: {message}")
+        except Exception as e:
+            print(f"Failed to send SMS: {e}")
+    else:
+        print(f"SMS (not sent - GSM unavailable): {message}")
+
+def control_motor(state, reason=""):
+    """Control water pump motor"""
+    if state:
+        GPIO.output(RELAY_PIN, GPIO.HIGH)
+        print("\n🟢 MOTOR STARTED")
+        if reason:
+            print(f"   Reason: {reason}")
+    else:
+        GPIO.output(RELAY_PIN, GPIO.LOW)
+        print("\n🔴 MOTOR STOPPED")
+        if reason:
+            print(f"   Reason: {reason}")
+
+def main():
+    """Main function"""
+    print("=" * 50)
+    print("   SMART IRRIGATION SYSTEM")
+    print("=" * 50)
+    print("Sensors: DHT22, Soil Moisture, Rain Sensor")
+    print("Press Ctrl+C to stop\n")
+    
+    motor_running = False
+    
+    try:
+        while True:
+            print("\n" + "=" * 50)
+            print(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            print("-" * 50)
+            
+            # Read DHT22 sensor
+            temperature, humidity = read_dht22()
+            if temperature is not None:
+                print(f"🌡️  Temperature: {temperature:.1f} °C")
+                print(f"💧 Humidity: {humidity:.1f} %")
+            else:
+                print("❌ DHT22 reading failed")
+                time.sleep(2)
+                continue
+            
+            # Read soil moisture sensor
+            soil_dry = read_soil_moisture()
+            if soil_dry is not None:
+                if soil_dry:
+                    print("🌱 Soil Moisture: DRY (needs water)")
+                else:
+                    print("🌱 Soil Moisture: WET (sufficient)")
+            else:
+                print("❌ Soil moisture reading failed")
+                time.sleep(2)
+                continue
+            
+            # Read rain sensor
+            no_rain = read_rain_sensor()
+            if no_rain is not None:
+                if no_rain:
+                    print("☀️  Rain Status: No rain")
+                else:
+                    print("🌧️  Rain Status: Rain detected")
+            else:
+                print("❌ Rain sensor reading failed")
+                time.sleep(2)
+                continue
+            
+            print("-" * 50)
+            
+            # Decision Logic for Motor Control
+            # Motor should run if:
+            # 1. Temperature > 25°C (hot weather)
+            # 2. Soil is DRY
+            # 3. No rain detected
+            
+            should_run = temperature > 25 and soil_dry and no_rain
+            
+            if should_run and not motor_running:
+                # Start motor
+                control_motor(True, "High temp, dry soil, no rain")
+                send_sms("Irrigation Started - Temp: {:.1f}C, Soil: Dry".format(temperature))
+                motor_running = True
+                
+            elif not should_run and motor_running:
+                # Stop motor
+                reasons = []
+                if temperature <= 25:
+                    reasons.append("Temperature normal")
+                if not soil_dry:
+                    reasons.append("Soil is wet")
+                if not no_rain:
+                    reasons.append("Rain detected")
+                
+                reason = ", ".join(reasons)
+                control_motor(False, reason)
+                send_sms("Irrigation Stopped - " + reason)
+                motor_running = False
+            
+            # Display current motor status
+            if motor_running:
+                print("⚙️  Motor Status: RUNNING")
+            else:
+                print("⚙️  Motor Status: OFF")
+            
+            print("=" * 50)
+            
+            # Wait before next reading
+            time.sleep(5)
+    
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Program stopped by user")
+        if motor_running:
+            control_motor(False, "System shutdown")
+            send_sms("System stopped by user")
+    
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+    
+    finally:
+        GPIO.output(RELAY_PIN, GPIO.LOW)
+        GPIO.cleanup()
+        if gsm_available:
+            ser.close()
+        print("\n✅ System cleanup complete")
+        print("Goodbye!\n")
+
+if __name__ == '__main__':
+    main()
