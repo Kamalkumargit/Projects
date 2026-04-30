@@ -1,1 +1,110 @@
+#include <DHTesp.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
 
+const int sensorPin = 33;
+DHTesp dhtSensor;
+
+
+String API_URL = "https://9000-firebase-studio-1759773931254.cluster-w5vd22whf5gmav2vgkomwtc4go.cloudworkstations.dev";
+String API_KEY = "agri_sk_0qpf1vyddrajhdo1ryqdjh7omempu0i0";  // 
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n\nESP32 DHT22 Data Logger Started...\n");
+  
+  // WiFi Connection
+  WiFi.disconnect();
+  WiFi.begin("Wokwi-GUEST", "");
+  
+  while(WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  
+  Serial.println("");
+  Serial.println("WiFi Connected Successfully");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+  
+  // DHT22 Sensor Setup
+  dhtSensor.setup(sensorPin, DHTesp::DHT22);
+  Serial.println("DHT22 Sensor Initialized\n");
+}
+
+void loop() {
+  delay(1000);
+
+  // Read sensor data
+  TempAndHumidity data = dhtSensor.getTempAndHumidity();
+  float t = data.temperature;
+  float h = data.humidity;
+
+  // Check if sensor reading failed
+  if (isnan(h) || isnan(t)) {
+    Serial.println("Failed to get the data from the sensor");
+    Serial.println("Check sensor before proceeding");
+    return;
+  }
+
+  // Display readings
+  Serial.print("Temperature: ");
+  Serial.print(t);
+  Serial.print(" °C, Humidity: ");
+  Serial.print(h);
+  Serial.println(" %");
+
+  // Send data to server (ThingSpeak style)
+  SendingData(t, h);
+  
+  delay(14000); // Total 15 seconds delay (1s + 14s)
+}
+
+void SendingData(float temp, float hum) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    
+    // Build URL with parameters (ThingSpeak style)
+    String url = API_URL + "/update?";
+    
+    // Add API key if provided
+    if (API_KEY != "YOUR_API_KEY_HERE" && API_KEY.length() > 0) {
+      url += "api_key=" + API_KEY + "&";
+    }
+    
+    // Add sensor data
+    url += "field1=" + String(temp, 2);
+    url += "&field2=" + String(hum, 2);
+    url += "&device=ESP32";
+    
+    // Print request details
+    Serial.println("Sending data...");
+    Serial.println("URL: " + url);
+    
+    // Make GET request
+    http.begin(url);
+    int httpResponseCode = http.GET();
+    
+    // Handle response
+    if (httpResponseCode > 0) {
+      Serial.print("Response Code: ");
+      Serial.println(httpResponseCode);
+      
+      String response = http.getString();
+      Serial.println("Response: " + response);
+      
+      if (httpResponseCode == 200) {
+        Serial.println("✓ Data sent successfully!");
+      }
+    } else {
+      Serial.print("Error sending data. Code: ");
+      Serial.println(httpResponseCode);
+    }
+    
+    http.end();
+    Serial.println("----------------------------");
+    
+  } else {
+    Serial.println("WiFi Disconnected");
+  }
+}
