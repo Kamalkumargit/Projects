@@ -1,1 +1,1203 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Wire.h>
 
+#include <Firebase_ESP_Client.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <LiquidCrystal_I2C.h>
+
+#include "MAX30100_PulseOximeter.h"
+
+#include <addons/TokenHelper.h>
+#include <addons/RTDBHelper.h>
+
+// ============================================================
+// WIFI
+// ============================================================
+
+#define WIFI_SSID "*********"
+#define WIFI_PASSWORD "**********"
+
+// ============================================================
+// FIREBASE
+// ============================================================
+
+#define API_KEY "*************************"
+
+#define DATABASE_URL \
+"https://health-monitor-esp32-77660-default-rtdb.asia-southeast1.firebasedatabase.app/"
+
+#define FIREBASE_USER_EMAIL "********************"
+#define FIREBASE_USER_PASSWORD "*****************"
+
+#define DEVICE_ID "ESP32-HM-001"
+
+// ============================================================
+// GPIO
+// ============================================================
+
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+#define TEMP_PIN 4
+#define SOS_PIN 27
+#define BUZZER_PIN 26
+#define LED_PIN 25
+
+// ============================================================
+// I2C DEVICES
+// ============================================================
+
+#define LCD_ADDRESS 0x27
+#define MAX30100_ADDRESS 0x57
+#define MPU_ADDR 0x68
+
+// ============================================================
+// TIMING
+// ============================================================
+
+#define REPORTING_PERIOD_MS 1000UL
+#define TEMP_CONVERSION_TIME_MS 750UL
+
+#define FALL_BUZZER_DURATION_MS 8000UL
+
+#define FALL_STILL_CONFIRM_MS 1200UL
+#define FALL_REARM_STABLE_MS 3000UL
+
+#define FALSE_FREEFALL_TIMEOUT_MS 1000UL
+#define IMPACT_CONFIRM_TIMEOUT_MS 5000UL
+
+#define WIFI_RECONNECT_INTERVAL_MS 10000UL
+#define FIREBASE_UPLOAD_INTERVAL_MS 2000UL
+
+#define SOS_DEBOUNCE_MS 50UL
+
+// ============================================================
+// MPU9250 REGISTERS
+// ============================================================
+
+#define MPU_PWR_MGMT_1 0x6B
+#define MPU_ACCEL_CONFIG 0x1C
+#define MPU_GYRO_CONFIG 0x1B
+#define MPU_ACCEL_XOUT_H 0x3B
+#define MPU_WHO_AM_I 0x75
+
+// ============================================================
+// FALL / MOTION THRESHOLDS
+// ============================================================
+
+#define MOTION_ACCEL_THRESHOLD 0.15f
+#define MOTION_GYRO_THRESHOLD 80.0f
+
+#define FREEFALL_THRESHOLD 0.40f
+#define IMPACT_THRESHOLD 2.20f
+
+#define POSTURE_GRAVITY_MIN 0.65f
+#define POSTURE_GRAVITY_MAX 1.35f
+
+// After impact, this range is treated as reasonably stable
+#define FALL_STABLE_ACCEL_MIN 0.65f
+#define FALL_STABLE_ACCEL_MAX 1.35f
+#define FALL_STABLE_GYRO_MAX 80.0f
+
+// ============================================================
+// FIREBASE
+// ============================================================
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ============================================================
+// TEMPERATURE
+// ============================================================
+
+OneWire oneWire(TEMP_PIN);
+DallasTemperature tempSensor(&oneWire);
+
+float temperature = 0.0f;
+
+// ============================================================
+// LCD
+// ============================================================
+
+LiquidCrystal_I2C lcd(
+    LCD_ADDRESS,
+    16,
+    2
+);
+
+bool lcdAvailable = false;
+bool tempAvailable = false;
+
+// Check whether an I2C device responds at the given address.
+bool i2cDevicePresent(uint8_t address)
+{
+    Wire.beginTransmission(address);
+    uint8_t error = Wire.endTransmission();
+    return error == 0;
+}
+
+void scanI2CBus()
+{
+    Serial.println("[I2C] Scanning bus...");
+
+    uint8_t found = 0;
+
+    for (uint8_t address = 1; address < 127; address++)
+    {
+        Wire.beginTransmission(address);
+        uint8_t error = Wire.endTransmission();
+
+        if (error == 0)
+        {
+            Serial.print("[I2C] Found 0x");
+            if (address < 0x10) Serial.print("0");
+            Serial.println(address, HEX);
+            found++;
+        }
+    }
+
+    if (found == 0)
+        Serial.println("[I2C] No devices found.");
+    else
+    {
+        Serial.print("[I2C] Total devices: ");
+        Serial.println(found);
+    }
+}
+
+// ============================================================
+// MAX30100
+// ============================================================
+
+PulseOximeter pox;
+
+bool maxSensorAvailable = false;
+
+float heartRate = 0.0f;
+float spo2 = 0.0f;
+
+// ============================================================
+// MPU9250
+// ============================================================
+
+bool mpuAvailable = false;
+
+float mpuAx = 0.0f;
+float mpuAy = 0.0f;
+float mpuAz = 0.0f;
+
+float mpuGx = 0.0f;
+float mpuGy = 0.0f;
+float mpuGz = 0.0f;
+
+float accelMagnitude = 1.0f;
+float gyroMagnitude = 0.0f;
+
+float previousAccel = 1.0f;
+
+// ============================================================
+// MOTION
+// ============================================================
+
+bool motionDetected = false;
+
+// ============================================================
+// POSTURE
+// ============================================================
+
+String posture = "UNKNOWN";
+
+// ============================================================
+// FALL STATE MACHINE
+// ============================================================
+
+bool freeFallDetected = false;
+bool impactDetected = false;
+
+bool fallDetected = false;
+
+// True when system is ready to detect a new fall
+bool fallArmed = true;
+
+// True while waiting for post-impact confirmation
+bool fallConfirmationPending = false;
+
+uint32_t freeFallTime = 0;
+uint32_t impactTime = 0;
+uint32_t fallStableSince = 0;
+
+// Used to re-arm the detector after the event
+uint32_t rearmStableSince = 0;
+
+// ============================================================
+// SOS / BUZZER
+// ============================================================
+
+bool sosState = false;
+
+bool fallSOSActive = false;
+
+bool fallBuzzerActive = false;
+
+uint32_t fallBuzzerStartTime = 0;
+
+// ============================================================
+// SOS BUTTON DEBOUNCE
+// ============================================================
+
+bool rawSOSState = false;
+bool stableSOSState = false;
+
+uint32_t sosChangeTime = 0;
+
+// ============================================================
+// TIMERS
+// ============================================================
+
+uint32_t lastReport = 0;
+uint32_t lastMAXReport = 0;
+uint32_t lastTempRequest = 0;
+uint32_t lastFirebaseUpload = 0;
+uint32_t lastWiFiReconnect = 0;
+uint32_t lastLCDUpdate = 0;
+
+// ============================================================
+// LCD CACHE
+// ============================================================
+
+String lastLCDLine1 = "";
+String lastLCDLine2 = "";
+
+// ============================================================
+// HEARTBEAT CALLBACK
+// ============================================================
+
+void onBeatDetected()
+{
+    Serial.println(">>> BEAT DETECTED");
+}
+
+// ============================================================
+// MPU WRITE
+// ============================================================
+
+bool mpuWriteRegister(
+    uint8_t reg,
+    uint8_t value
+)
+{
+    Wire.beginTransmission(MPU_ADDR);
+
+    Wire.write(reg);
+    Wire.write(value);
+
+    return Wire.endTransmission() == 0;
+}
+
+// ============================================================
+// MPU READ
+// ============================================================
+
+bool mpuReadRegisters(
+    uint8_t reg,
+    uint8_t *data,
+    uint8_t count
+)
+{
+    Wire.beginTransmission(MPU_ADDR);
+
+    Wire.write(reg);
+
+    if (Wire.endTransmission(false) != 0)
+    {
+        return false;
+    }
+
+    uint8_t received =
+        Wire.requestFrom(
+            (uint8_t)MPU_ADDR,
+            (uint8_t)count
+        );
+
+    if (received != count)
+    {
+        return false;
+    }
+
+    for (uint8_t i = 0; i < count; i++)
+    {
+        data[i] = Wire.read();
+    }
+
+    return true;
+}
+
+// ============================================================
+// READ MPU9250
+// ============================================================
+
+bool readMPU()
+{
+    uint8_t data[14];
+
+    if (
+        !mpuReadRegisters(
+            MPU_ACCEL_XOUT_H,
+            data,
+            14
+        )
+    )
+    {
+        return false;
+    }
+
+    int16_t axRaw =
+        (int16_t)(
+            ((uint16_t)data[0] << 8) |
+            data[1]
+        );
+
+    int16_t ayRaw =
+        (int16_t)(
+            ((uint16_t)data[2] << 8) |
+            data[3]
+        );
+
+    int16_t azRaw =
+        (int16_t)(
+            ((uint16_t)data[4] << 8) |
+            data[5]
+        );
+
+    int16_t gxRaw =
+        (int16_t)(
+            ((uint16_t)data[8] << 8) |
+            data[9]
+        );
+
+    int16_t gyRaw =
+        (int16_t)(
+            ((uint16_t)data[10] << 8) |
+            data[11]
+        );
+
+    int16_t gzRaw =
+        (int16_t)(
+            ((uint16_t)data[12] << 8) |
+            data[13]
+        );
+
+    // ±2g
+    mpuAx = axRaw / 16384.0f;
+    mpuAy = ayRaw / 16384.0f;
+    mpuAz = azRaw / 16384.0f;
+
+    // ±250 dps
+    mpuGx = gxRaw / 131.0f;
+    mpuGy = gyRaw / 131.0f;
+    mpuGz = gzRaw / 131.0f;
+
+    accelMagnitude =
+        sqrtf(
+            mpuAx * mpuAx +
+            mpuAy * mpuAy +
+            mpuAz * mpuAz
+        );
+
+    gyroMagnitude =
+        sqrtf(
+            mpuGx * mpuGx +
+            mpuGy * mpuGy +
+            mpuGz * mpuGz
+        );
+
+    return true;
+}
+
+// ============================================================
+// INITIALIZE MPU
+// ============================================================
+
+bool initMPU()
+{
+    Serial.println();
+    Serial.println(
+        "[MPU9250] Initializing..."
+    );
+
+    uint8_t whoAmI = 0;
+
+    if (
+        !mpuReadRegisters(
+            MPU_WHO_AM_I,
+            &whoAmI,
+            1
+        )
+    )
+    {
+        Serial.println(
+            "[MPU9250] Communication FAILED"
+        );
+
+        return false;
+    }
+
+    Serial.print(
+        "[MPU9250] WHO_AM_I: 0x"
+    );
+
+    Serial.println(
+        whoAmI,
+        HEX
+    );
+
+    if (
+        !mpuWriteRegister(
+            MPU_PWR_MGMT_1,
+            0x00
+        )
+    )
+    {
+        Serial.println(
+            "[MPU9250] Wake-up failed."
+        );
+
+        return false;
+    }
+
+    delay(100);
+
+    // ±2g accelerometer
+    mpuWriteRegister(
+        MPU_ACCEL_CONFIG,
+        0x00
+    );
+
+    // ±250 dps gyro
+    mpuWriteRegister(
+        MPU_GYRO_CONFIG,
+        0x00
+    );
+
+    if (!readMPU())
+    {
+        Serial.println(
+            "[MPU9250] Initial sensor read failed."
+        );
+
+        return false;
+    }
+
+    previousAccel =
+        accelMagnitude;
+
+    Serial.println(
+        "[MPU9250] INITIALIZATION SUCCESS"
+    );
+
+    return true;
+}
+
+// ============================================================
+// POSTURE DETECTION
+// ============================================================
+
+void detectPosture()
+{
+    if (!mpuAvailable)
+    {
+        posture = "UNKNOWN";
+        return;
+    }
+
+    float ax = fabsf(mpuAx);
+    float ay = fabsf(mpuAy);
+    float az = fabsf(mpuAz);
+
+    if (
+        accelMagnitude <
+        POSTURE_GRAVITY_MIN ||
+        accelMagnitude >
+        POSTURE_GRAVITY_MAX
+    )
+    {
+        posture = "MOVING";
+        return;
+    }
+
+    if (
+        az > ax &&
+        az > ay
+    )
+    {
+        posture = "UPRIGHT";
+    }
+    else if (
+        ax > ay &&
+        ax > az
+    )
+    {
+        posture = "SIDE";
+    }
+    else
+    {
+        posture = "LYING";
+    }
+}
+
+// ============================================================
+// MOTION DETECTION
+// ============================================================
+
+void detectMotion()
+{
+    float accelChange =
+        fabsf(
+            accelMagnitude -
+            previousAccel
+        );
+
+    previousAccel =
+        accelMagnitude;
+
+    motionDetected =
+        (
+            accelChange >
+            MOTION_ACCEL_THRESHOLD
+        )
+        ||
+        (
+            gyroMagnitude >
+            MOTION_GYRO_THRESHOLD
+        );
+}
+
+// ============================================================
+// FALL DETECTION HELPERS
+// ============================================================
+
+void clearFallCandidate(const char *reason)
+{
+    freeFallDetected = false;
+    impactDetected = false;
+    fallConfirmationPending = false;
+    fallStableSince = 0;
+    freeFallTime = 0;
+    impactTime = 0;
+
+    if (reason != nullptr)
+    {
+        Serial.print("[FALL] ");
+        Serial.println(reason);
+    }
+}
+
+// ============================================================
+// FALL DETECTION
+// ============================================================
+
+void detectFall()
+{
+    if (!mpuAvailable)
+    {
+        return;
+    }
+
+    const uint32_t now = millis();
+
+    // 1. FREE FALL
+    if (
+        fallArmed &&
+        !freeFallDetected &&
+        !fallConfirmationPending &&
+        accelMagnitude < FREEFALL_THRESHOLD
+    )
+    {
+        freeFallDetected = true;
+        freeFallTime = now;
+
+        Serial.println();
+        Serial.println(">>> FREE FALL DETECTED <<<");
+    }
+
+    // 2. IMPACT MUST FOLLOW A RECENT FREE FALL
+    if (
+        fallArmed &&
+        freeFallDetected &&
+        !impactDetected &&
+        accelMagnitude > IMPACT_THRESHOLD
+    )
+    {
+        impactDetected = true;
+        freeFallDetected = false;
+
+        impactTime = now;
+        fallConfirmationPending = true;
+        fallStableSince = 0;
+
+        Serial.println(">>> IMPACT DETECTED <<<");
+    }
+
+    // 3. POST-IMPACT STABILITY
+    if (fallConfirmationPending)
+    {
+        bool stableAfterImpact =
+            accelMagnitude >= FALL_STABLE_ACCEL_MIN &&
+            accelMagnitude <= FALL_STABLE_ACCEL_MAX &&
+            gyroMagnitude <= FALL_STABLE_GYRO_MAX;
+
+        if (stableAfterImpact)
+        {
+            if (fallStableSince == 0)
+            {
+                fallStableSince = now;
+            }
+
+            if (
+                now - fallStableSince >=
+                FALL_STILL_CONFIRM_MS
+            )
+            {
+                // CONFIRMED FALL
+                fallDetected = true;
+                fallArmed = false;
+
+                fallConfirmationPending = false;
+                freeFallDetected = false;
+                impactDetected = false;
+                fallStableSince = 0;
+                rearmStableSince = 0;
+
+                fallSOSActive = true;
+                fallBuzzerActive = true;
+                fallBuzzerStartTime = now;
+
+                digitalWrite(BUZZER_PIN, HIGH);
+
+                Serial.println();
+                Serial.println("========================================");
+                Serial.println("        !!! FALL CONFIRMED !!!");
+                Serial.println("        !!! SOS ACTIVE !!!");
+                Serial.println("        !!! BUZZER ON !!!");
+                Serial.println("        !!! 8 SECONDS !!!");
+                Serial.println("========================================");
+                Serial.println();
+            }
+        }
+        else
+        {
+            fallStableSince = 0;
+        }
+
+        if (
+            fallConfirmationPending &&
+            now - impactTime >= IMPACT_CONFIRM_TIMEOUT_MS
+        )
+        {
+            clearFallCandidate(
+                "Impact confirmation timeout; candidate cleared."
+            );
+        }
+    }
+
+    // 4. FALSE FREE FALL
+    if (
+        freeFallDetected &&
+        now - freeFallTime >= FALSE_FREEFALL_TIMEOUT_MS
+    )
+    {
+        clearFallCandidate(
+            "Free-fall candidate cleared."
+        );
+    }
+
+    // 5. AUTOMATIC RE-ARM AFTER CONFIRMED FALL
+    if (
+        !fallArmed &&
+        !freeFallDetected &&
+        !impactDetected &&
+        !fallConfirmationPending
+    )
+    {
+        bool stable =
+            accelMagnitude >= FALL_STABLE_ACCEL_MIN &&
+            accelMagnitude <= FALL_STABLE_ACCEL_MAX &&
+            gyroMagnitude <= FALL_STABLE_GYRO_MAX;
+
+        if (stable)
+        {
+            if (rearmStableSince == 0)
+            {
+                rearmStableSince = now;
+            }
+
+            if (
+                now - rearmStableSince >=
+                FALL_REARM_STABLE_MS
+            )
+            {
+                fallArmed = true;
+                fallSOSActive = false;
+                fallDetected = false;
+                rearmStableSince = 0;
+
+                Serial.println(
+                    "[FALL] Detector re-armed. Fall SOS cleared."
+                );
+            }
+        }
+        else
+        {
+            rearmStableSince = 0;
+        }
+    }
+}
+
+// ============================================================
+// TEMPERATURE
+// ============================================================
+
+void updateTemperature()
+{
+    if (!tempAvailable)
+        return;
+
+    if (millis() - lastTempRequest < TEMP_CONVERSION_TIME_MS)
+        return;
+
+    float newTemperature = tempSensor.getTempCByIndex(0);
+
+    if (newTemperature != DEVICE_DISCONNECTED_C &&
+        newTemperature > -55.0f &&
+        newTemperature < 125.0f)
+    {
+        temperature = newTemperature;
+    }
+    else
+    {
+        Serial.println("[TEMP] Sensor read failed.");
+    }
+
+    tempSensor.requestTemperatures();
+    lastTempRequest = millis();
+}
+
+// ============================================================
+// MAX30100
+// ============================================================
+
+void updateMAX30100()
+{
+    if (!maxSensorAvailable)
+        return;
+
+    pox.update();
+
+    if (millis() - lastMAXReport < REPORTING_PERIOD_MS)
+        return;
+
+    lastMAXReport = millis();
+
+    float rawHeartRate = pox.getHeartRate();
+    uint8_t rawSpO2 = pox.getSpO2();
+
+    if (rawHeartRate >= 35.0f && rawHeartRate <= 220.0f)
+        heartRate = rawHeartRate;
+
+    if (rawSpO2 >= 70 && rawSpO2 <= 100)
+        spo2 = rawSpO2;
+}
+
+// ============================================================
+// WIFI & FIREBASE MAINTENANCE
+// ============================================================
+
+void connectWiFi()
+{
+    if (WiFi.status() == WL_CONNECTED)
+        return;
+
+    Serial.print("[WIFI] Connecting");
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000)
+    {
+        delay(250);
+        Serial.print(".");
+    }
+
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        Serial.println("[WIFI] Connected!");
+        Serial.print("[WIFI] IP: ");
+        Serial.println(WiFi.localIP());
+    }
+    else
+    {
+        Serial.println("[WIFI] Connection failed.");
+    }
+}
+
+void maintainWiFi()
+{
+    if (WiFi.status() == WL_CONNECTED)
+        return;
+
+    if (millis() - lastWiFiReconnect < WIFI_RECONNECT_INTERVAL_MS)
+        return;
+
+    lastWiFiReconnect = millis();
+    Serial.println("[WIFI] Reconnecting...");
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+void initFirebase()
+{
+    config.api_key = API_KEY;
+    config.database_url = DATABASE_URL;
+    config.token_status_callback = tokenStatusCallback;
+
+    auth.user.email = FIREBASE_USER_EMAIL;
+    auth.user.password = FIREBASE_USER_PASSWORD;
+
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectNetwork(true);
+
+    Serial.println("[FIREBASE] Initialized.");
+}
+
+void uploadFirebase()
+{
+    if (WiFi.status() != WL_CONNECTED || !Firebase.ready())
+        return;
+
+    if (millis() - lastFirebaseUpload < FIREBASE_UPLOAD_INTERVAL_MS)
+        return;
+
+    lastFirebaseUpload = millis();
+
+    FirebaseJson data;
+    data.set("deviceId", DEVICE_ID);
+    data.set("temperature", temperature);
+    data.set("heartRate", heartRate);
+    data.set("spo2", spo2);
+    data.set("motion", motionDetected ? "YES" : "NO");
+    data.set("posture", posture);
+    data.set("fallDetected", fallDetected);
+    data.set("freeFallDetected", freeFallDetected);
+    data.set("impactDetected", impactDetected);
+    data.set("fallSOSActive", fallSOSActive);
+    data.set("fallBuzzerActive", fallBuzzerActive);
+    data.set("fallArmed", fallArmed);
+    data.set("sos", sosState);
+    data.set("accelX", mpuAx);
+    data.set("accelY", mpuAy);
+    data.set("accelZ", mpuAz);
+    data.set("gyroX", mpuGx);
+    data.set("gyroY", mpuGy);
+    data.set("gyroZ", mpuGz);
+    data.set("accelMagnitude", accelMagnitude);
+    data.set("gyroMagnitude", gyroMagnitude);
+    data.set("max30100Available", maxSensorAvailable);
+    data.set("mpu9250Available", mpuAvailable);
+    data.set("wifiConnected", WiFi.status() == WL_CONNECTED);
+    data.set("timestamp", millis());
+
+    String path = String("/health_data/") + String(DEVICE_ID);
+
+    bool result = Firebase.RTDB.setJSONAsync(&fbdo, path.c_str(), &data);
+
+    if (!result)
+    {
+        Serial.print("[FIREBASE] Queue failed: ");
+        Serial.println(fbdo.errorReason());
+    }
+}
+
+// ============================================================
+// SOS & BUZZER CONTROLS
+// ============================================================
+
+void updateSOSButton()
+{
+    bool currentRaw = (digitalRead(SOS_PIN) == LOW);
+
+    if (currentRaw != rawSOSState)
+    {
+        rawSOSState = currentRaw;
+        sosChangeTime = millis();
+    }
+
+    if (millis() - sosChangeTime >= SOS_DEBOUNCE_MS)
+    {
+        stableSOSState = rawSOSState;
+    }
+}
+
+void updateBuzzer()
+{
+    if (stableSOSState)
+    {
+        digitalWrite(BUZZER_PIN, HIGH);
+        return;
+    }
+
+    if (fallBuzzerActive)
+    {
+        if (millis() - fallBuzzerStartTime >= FALL_BUZZER_DURATION_MS)
+        {
+            fallBuzzerActive = false;
+            digitalWrite(BUZZER_PIN, LOW);
+            Serial.println("[FALL] Buzzer OFF after 8 seconds.");
+        }
+        else
+        {
+            digitalWrite(BUZZER_PIN, HIGH);
+        }
+        return;
+    }
+
+    digitalWrite(BUZZER_PIN, LOW);
+}
+
+void updateSOSState()
+{
+    sosState = stableSOSState || fallSOSActive;
+    digitalWrite(LED_PIN, sosState ? HIGH : LOW);
+}
+
+// ============================================================
+// LCD DISPLAY MANAGEMENT
+// ============================================================
+
+void writeLCD(String line1, String line2)
+{
+    if (!lcdAvailable)
+        return;
+
+    if (line1 == lastLCDLine1 && line2 == lastLCDLine2)
+        return;
+
+    lastLCDLine1 = line1;
+    lastLCDLine2 = line2;
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(line1.substring(0, 16));
+    lcd.setCursor(0, 1);
+    lcd.print(line2.substring(0, 16));
+}
+
+void updateLCD()
+{
+    if (millis() - lastLCDUpdate < REPORTING_PERIOD_MS)
+        return;
+
+    lastLCDUpdate = millis();
+
+    String line1, line2;
+
+    if (fallSOSActive)
+    {
+        line1 = "FALL! SOS ACTIVE";
+        if (fallBuzzerActive)
+        {
+            uint32_t elapsed = millis() - fallBuzzerStartTime;
+            uint32_t remaining = (elapsed < FALL_BUZZER_DURATION_MS)
+                                ? (FALL_BUZZER_DURATION_MS - elapsed)
+                                : 0;
+            line2 = "BUZZER " + String((remaining + 999) / 1000) + " SEC";
+        }
+        else
+        {
+            line2 = "BUZZER OFF";
+        }
+    }
+    else if (stableSOSState)
+    {
+        line1 = "MANUAL SOS";
+        line2 = "BUZZER ON";
+    }
+    else
+    {
+        line1 = "HR:" + String((int)heartRate) + " Sp:" + String((int)spo2);
+        line2 = String(temperature, 1) + "C " + posture;
+    }
+
+    writeLCD(line1, line2);
+}
+
+// ============================================================
+// SERIAL OUTPUT & DIAGNOSTICS
+// ============================================================
+
+void printStatus()
+{
+    if (millis() - lastReport < REPORTING_PERIOD_MS)
+        return;
+
+    lastReport = millis();
+
+    Serial.println();
+    Serial.println("----------------------------------------");
+    Serial.print("Temperature : "); Serial.print(temperature, 1); Serial.println(" C");
+    Serial.print("Heart Rate  : "); Serial.print(heartRate, 1); Serial.println(" BPM");
+    Serial.print("SpO2        : "); Serial.print(spo2, 0); Serial.println(" %");
+    Serial.print("Posture     : "); Serial.println(posture);
+    Serial.print("Motion      : "); Serial.println(motionDetected ? "YES" : "NO");
+    Serial.print("Free Fall   : "); Serial.println(freeFallDetected ? "YES" : "NO");
+    Serial.print("Impact      : "); Serial.println(impactDetected ? "YES" : "NO");
+    Serial.print("Fall SOS    : "); Serial.println(fallSOSActive ? "ACTIVE" : "NORMAL");
+    Serial.print("Fall Buzzer : "); Serial.println(fallBuzzerActive ? "ACTIVE" : "OFF");
+    Serial.print("Fall Armed  : "); Serial.println(fallArmed ? "YES" : "NO");
+    Serial.print("Manual SOS  : "); Serial.println(stableSOSState ? "ACTIVE" : "NORMAL");
+    Serial.print("SOS         : "); Serial.println(sosState ? "ACTIVE" : "NORMAL");
+
+    if (mpuAvailable)
+    {
+        Serial.print("MPU Accel   : ");
+        Serial.print(mpuAx, 2); Serial.print(" ");
+        Serial.print(mpuAy, 2); Serial.print(" ");
+        Serial.println(mpuAz, 2);
+        Serial.print("MPU Gyro    : ");
+        Serial.print(mpuGx, 2); Serial.print(" ");
+        Serial.print(mpuGy, 2); Serial.print(" ");
+        Serial.println(mpuGz, 2);
+    }
+    Serial.println("----------------------------------------");
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup()
+{
+    Serial.begin(115200);
+    while (!Serial && millis() < 3000);
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("   ESP32 HEALTH & FALL MONITOR STARTING  ");
+    Serial.println("========================================");
+
+    // GPIO Setup
+    pinMode(SOS_PIN, INPUT_PULLUP);
+    pinMode(BUZZER_PIN, OUTPUT);
+    pinMode(LED_PIN, OUTPUT);
+
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(LED_PIN, LOW);
+
+    // Initialize I2C Bus
+    Wire.begin(I2C_SDA, I2C_SCL);
+    scanI2CBus();
+
+    // LCD Initialization
+    if (i2cDevicePresent(LCD_ADDRESS))
+    {
+        lcd.init();
+        lcd.backlight();
+        lcdAvailable = true;
+        writeLCD("Health Monitor", "Initializing...");
+        Serial.println("[LCD] Initialized.");
+    }
+    else
+    {
+        Serial.println("[LCD] Not found on I2C bus.");
+    }
+
+    // Dallas Temp Initialization
+    tempSensor.begin();
+    if (tempSensor.getDS18Count() > 0)
+    {
+        tempAvailable = true;
+        tempSensor.setWaitForConversion(false);
+        tempSensor.requestTemperatures();
+        lastTempRequest = millis();
+        Serial.println("[DS18B20] Sensor initialized.");
+    }
+    else
+    {
+        Serial.println("[DS18B20] No sensor found.");
+    }
+
+    // MAX30100 Initialization
+    if (i2cDevicePresent(MAX30100_ADDRESS))
+    {
+        Serial.print("[MAX30100] Initializing... ");
+        if (pox.begin())
+        {
+            maxSensorAvailable = true;
+            pox.setOnBeatDetectedCallback(onBeatDetected);
+            Serial.println("SUCCESS");
+        }
+        else
+        {
+            Serial.println("FAILED");
+        }
+    }
+    else
+    {
+        Serial.println("[MAX30100] Not found on I2C bus.");
+    }
+
+    // MPU9250 Initialization
+    if (i2cDevicePresent(MPU_ADDR))
+    {
+        mpuAvailable = initMPU();
+    }
+    else
+    {
+        Serial.println("[MPU9250] Not found on I2C bus.");
+    }
+
+    // Network & Cloud Setup
+    connectWiFi();
+    initFirebase();
+
+    if (lcdAvailable)
+    {
+        writeLCD("System Ready", DEVICE_ID);
+    }
+
+    Serial.println("[SYSTEM] Setup complete. Entering main loop.");
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void loop()
+{
+    // High-frequency sensor updates
+    updateMAX30100();
+
+    if (mpuAvailable && readMPU())
+    {
+        detectMotion();
+        detectPosture();
+        detectFall();
+    }
+
+    // Periodic tasks & state machines
+    updateTemperature();
+    updateSOSButton();
+    updateBuzzer();
+    updateSOSState();
+    updateLCD();
+
+    // Connectivity & Cloud tasks
+    maintainWiFi();
+    uploadFirebase();
+
+    // Diagnostic logging
+    printStatus();
+}
